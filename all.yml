@@ -53,7 +53,7 @@ slurm_version: "26.05.2"
 # dpkg-buildpackage typically drops them one directory ABOVE the source
 # tree it was run from (e.g. if you built in ~/slurm-26.05.2/, look in
 # ~/ for slurm-smd*_26.05.2*.deb). Update this to your actual path.
-slurm_deb_build_dir: /root/slurm-build
+slurm_deb_build_dir: ~/slurm-26.05.2/
 
 # Glob patterns (relative to slurm_deb_build_dir) used to find the .deb
 # files to ship to compute nodes.
