@@ -35,15 +35,56 @@ slurm_uid: 982
 slurm_gid: 982
 
 # ---------------------------------------------------------------------------
-# Packages (Ubuntu apt names)
+# Packages (Ubuntu apt names) — munge only. SLURM itself is installed from
+# custom-built .deb packages, see the "SLURM build" section below.
 # ---------------------------------------------------------------------------
 munge_packages:
   - munge
   - libmunge2
 
-slurmd_packages:
+# ---------------------------------------------------------------------------
+# SLURM build — installed from .deb packages YOU built (e.g. via
+# dpkg-buildpackage or checkinstall), not from apt. Ubuntu's default repos
+# only carry old LTS-packaged SLURM versions and won't give you 26.05.2.
+# ---------------------------------------------------------------------------
+slurm_version: "26.05.2"
+
+# Directory ON THE CONTROLLER where your built .deb files landed.
+# dpkg-buildpackage typically drops them one directory ABOVE the source
+# tree it was run from (e.g. if you built in ~/slurm-26.05.2/, look in
+# ~/ for slurm-smd*_26.05.2*.deb). Update this to your actual path.
+slurm_deb_build_dir: /root/slurm-build
+
+# Glob patterns (relative to slurm_deb_build_dir) used to find the .deb
+# files to ship to compute nodes.
+slurm_deb_include_patterns:
+  - "*.deb"
+
+# Patterns to exclude — debug symbol packages and docs aren't needed on
+# a compute node and just slow down the copy.
+slurm_deb_exclude_patterns:
+  - "*dbgsym*"
+  - "*-doc_*"
+
+# Directory on the compute node where .deb packages are staged before
+# `apt-get install ./*.deb` is run against them.
+slurm_deb_remote_staging_dir: /tmp/slurm-debs
+
+# apt package names to purge if found before installing our .deb build —
+# covers Ubuntu's stock SLURM packaging under either its old or current
+# naming scheme. Extend this list if your distro/release uses different
+# names (check with `apt list --installed | grep -i slurm` on the node).
+legacy_slurm_apt_packages:
   - slurmd
   - slurm-client
+  - slurm-wlm
+  - slurm-wlm-basic-plugins
+  - slurm-wlm-torque
+
+# Delete /var/spool/slurmd contents when purging a legacy install, so no
+# stale state from the old version's slurmd sticks around. Recreated
+# fresh (empty) further down before the new slurmd starts.
+purge_stale_spool: true
 
 # ---------------------------------------------------------------------------
 # Filesystem layout on the compute node

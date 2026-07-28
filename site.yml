@@ -5,16 +5,22 @@
 # Run this FROM the SLURM controller (or any control machine that can SSH to
 # both the controller and the new node). It:
 #
-#   Play 1  Pulls munge.key + slurm.conf (+ optional extra confs) off the
+#   Play 1  Pulls munge.key, slurm.conf (+ optional extra confs), and your
+#           custom-built SLURM {{ slurm_version }} .deb packages off the
 #           controller and stages them locally.
-#   Play 2  Installs munge/slurmd on the new node(s), creates matching
-#           munge/slurm users, deploys the staged configs, and starts
-#           services.
+#   Play 2  Creates matching munge/slurm users first, then installs munge
+#           (from apt) and SLURM (from the staged .deb packages — NOT apt,
+#           since Ubuntu's repos only carry old LTS-packaged versions),
+#           deploys the staged configs, and starts services.
 #   Play 3  (optional) Tells slurmctld to reconfigure and shows node status.
 #
-# Prerequisite: the new node(s) must already appear as NodeName entries in
-# slurm.conf on the controller — this playbook copies slurm.conf as-is, it
-# does not edit it for you.
+# Prerequisites:
+#   - The new node(s) must already appear as NodeName entries in slurm.conf
+#     on the controller — this playbook copies slurm.conf as-is, it does
+#     not edit it for you.
+#   - slurm_deb_build_dir (group_vars/all.yml) must point at wherever your
+#     dpkg-buildpackage / checkinstall run dropped the built .deb files on
+#     the controller.
 #
 # Usage:
 #   ansible-playbook site.yml
@@ -22,19 +28,22 @@
 #   ansible-playbook site.yml --skip-tags reconfigure
 # =============================================================================
 
-- name: Gather munge key and SLURM configs from the controller
+- name: Gather munge key, SLURM configs, and built .deb packages from the controller
   hosts: slurm_controller
   become: true
   gather_facts: false
   tasks:
-    - name: Ensure local staging directory exists
+    - name: Ensure local staging directories exist
       become: false
       delegate_to: localhost
       run_once: true
       ansible.builtin.file:
-        path: "{{ local_staging_dir }}"
+        path: "{{ item }}"
         state: directory
         mode: "0700"
+      loop:
+        - "{{ local_staging_dir }}"
+        - "{{ local_staging_dir }}/debs"
 
     - name: Verify munge key exists on controller
       ansible.builtin.stat:
@@ -89,6 +98,35 @@
         label: "{{ item.item }}"
       when: item.stat.exists
 
+    # -------------------------------------------------------------------
+    # Custom-built SLURM {{ slurm_version }} .deb packages
+    # -------------------------------------------------------------------
+    - name: Find built SLURM .deb packages on controller
+      ansible.builtin.find:
+        paths: "{{ slurm_deb_build_dir }}"
+        patterns: "{{ slurm_deb_include_patterns }}"
+        excludes: "{{ slurm_deb_exclude_patterns }}"
+        file_type: file
+      register: slurm_deb_files
+
+    - name: Fail if no SLURM .deb packages were found
+      ansible.builtin.fail:
+        msg: >-
+          No SLURM .deb packages matching {{ slurm_deb_include_patterns }}
+          found under {{ slurm_deb_build_dir }} on {{ inventory_hostname }}.
+          Set slurm_deb_build_dir to wherever dpkg-buildpackage /
+          checkinstall dropped your built {{ slurm_version }} packages.
+      when: slurm_deb_files.matched == 0
+
+    - name: Fetch SLURM .deb packages
+      ansible.builtin.fetch:
+        src: "{{ item.path }}"
+        dest: "{{ local_staging_dir }}/debs/{{ item.path | basename }}"
+        flat: true
+      loop: "{{ slurm_deb_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
 # =============================================================================
 
 - name: Configure fresh Ubuntu host as a SLURM compute node
@@ -100,37 +138,56 @@
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Install munge packages
-      ansible.builtin.apt:
-        name: "{{ munge_packages }}"
-        state: present
-
-    - name: Install slurmd packages
-      ansible.builtin.apt:
-        name: "{{ slurmd_packages }}"
-        state: present
-
     # -------------------------------------------------------------------
-    # apt installing the munge/slurmd packages starts+enables their
-    # daemons by default on Ubuntu. Stop them now, before we try to
-    # change the munge/slurm user UIDs below — usermod refuses to touch
-    # the UID of a user with a live running process.
+    # Purge any old apt-installed SLURM packages (e.g. Ubuntu's stock
+    # 21.08.5) before we install our own .deb-built version. Safe to run
+    # against a genuinely fresh node too — package_facts just won't find
+    # anything, so nothing below fires. This matters because:
+    #   - our .deb build and Ubuntu's stock packages likely ship the same
+    #     binary paths (/usr/sbin/slurmd etc.) under different package
+    #     names, which dpkg will refuse to overwrite;
+    #   - a running old slurmd would block the slurm user's UID change
+    #     below the same way munge's did earlier.
     # -------------------------------------------------------------------
-    - name: Stop munge before changing its UID
-      ansible.builtin.systemd:
-        name: munge
-        state: stopped
-      failed_when: false
+    - name: Gather installed package facts
+      ansible.builtin.package_facts:
+        manager: apt
 
-    - name: Stop slurmd before changing its UID
+    - name: Determine if any legacy apt SLURM packages are installed
+      ansible.builtin.set_fact:
+        legacy_slurm_installed: "{{ legacy_slurm_apt_packages | intersect(ansible_facts.packages.keys()) }}"
+
+    - name: Stop slurmd before removing the old package
       ansible.builtin.systemd:
         name: slurmd
         state: stopped
       failed_when: false
+      when: legacy_slurm_installed | length > 0
+
+    - name: Purge legacy apt-installed SLURM packages
+      ansible.builtin.apt:
+        name: "{{ legacy_slurm_installed }}"
+        state: absent
+        purge: true
+        autoremove: true
+      when: legacy_slurm_installed | length > 0
+
+    - name: Clear stale slurmd spool contents from the old install
+      ansible.builtin.file:
+        path: "{{ slurmd_spool_dir }}"
+        state: absent
+      when:
+        - legacy_slurm_installed | length > 0
+        - purge_stale_spool
 
     # -------------------------------------------------------------------
-    # Users/groups — UIDs/GIDs must be identical across the whole cluster
-    # or munge auth + slurmd file ownership will break.
+    # Create the munge/slurm users BEFORE installing any packages, with
+    # the UID/GID pinned. Debian package post-install scripts check for
+    # an existing user of the right name and skip creating their own —
+    # so this way there's never a mismatched-UID window, no running
+    # daemon holding the old UID, and no follow-up chown needed: each
+    # package's own postinst sets up ownership against the account that
+    # already exists.
     # -------------------------------------------------------------------
     - name: Ensure munge group exists with correct GID
       ansible.builtin.group:
@@ -167,11 +224,49 @@
         create_home: false
 
     # -------------------------------------------------------------------
-    # munge key
-    # (munge is already stopped from the UID-change step above; this is
-    # just a safety net in case it got started some other way)
+    # munge — still a plain apt package, not a custom build
     # -------------------------------------------------------------------
-    - name: Ensure munge is stopped before replacing key
+    - name: Install munge packages
+      ansible.builtin.apt:
+        name: "{{ munge_packages }}"
+        state: present
+
+    # -------------------------------------------------------------------
+    # SLURM {{ slurm_version }} — install from the .deb packages built on
+    # the controller, NOT from apt (Ubuntu's repos only have old
+    # LTS-packaged SLURM versions, e.g. 21.08.5, which won't speak the
+    # wire protocol correctly against a {{ slurm_version }} controller).
+    # -------------------------------------------------------------------
+    - name: Ensure remote staging dir for SLURM .deb packages exists
+      ansible.builtin.file:
+        path: "{{ slurm_deb_remote_staging_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copy built SLURM {{ slurm_version }} .deb packages to compute node
+      ansible.builtin.copy:
+        src: "{{ local_staging_dir }}/debs/"
+        dest: "{{ slurm_deb_remote_staging_dir }}/"
+        mode: "0644"
+      register: slurm_deb_copy
+
+    - name: Install SLURM {{ slurm_version }} from local .deb packages
+      ansible.builtin.shell: apt-get install -y ./*.deb
+      args:
+        chdir: "{{ slurm_deb_remote_staging_dir }}"
+      register: slurm_deb_install
+      changed_when: "'Setting up' in slurm_deb_install.stdout or 'Unpacking' in slurm_deb_install.stdout"
+
+    - name: Verify installed slurmd reports the expected version
+      ansible.builtin.command: slurmd -V
+      register: slurmd_version_check
+      changed_when: false
+      failed_when: slurm_version not in slurmd_version_check.stdout
+
+    # -------------------------------------------------------------------
+    # munge key
+    # -------------------------------------------------------------------
+    - name: Stop munge before replacing key
       ansible.builtin.systemd:
         name: munge
         state: stopped
@@ -283,7 +378,7 @@
       ansible.builtin.shell: munge -n | unmunge
       register: munge_test
       changed_when: false
-      failed_when: "'STATUS:  Success' not in munge_test.stdout"
+      failed_when: "'Success' not in munge_test.stdout"
 
   handlers:
     - name: restart munge
