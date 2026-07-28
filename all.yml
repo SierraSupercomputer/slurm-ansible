@@ -1,0 +1,59 @@
+---
+# ---------------------------------------------------------------------------
+# Source locations on the SLURM controller
+# ---------------------------------------------------------------------------
+munge_key_src: /etc/munge/munge.key
+slurm_conf_src_dir: /etc/slurm
+
+# Extra config files to replicate if present on the controller (missing ones
+# are skipped automatically — e.g. slurmdbd.conf normally only lives on the
+# accounting host, not a generic controller).
+slurm_extra_conf_files:
+  - cgroup.conf
+  - gres.conf
+  - topology.conf
+  - slurm.epilog
+  - slurm.prolog
+
+# Where fetched files are staged on the Ansible control machine
+local_staging_dir: /tmp/slurm_cluster_files
+
+# ---------------------------------------------------------------------------
+# munge user/group — UID/GID MUST match across every node in the cluster
+# ---------------------------------------------------------------------------
+munge_user: munge
+munge_group: munge
+munge_uid: 981
+munge_gid: 981
+
+# ---------------------------------------------------------------------------
+# slurm user/group — UID/GID MUST match across every node in the cluster
+# ---------------------------------------------------------------------------
+slurm_user: slurm
+slurm_group: slurm
+slurm_uid: 982
+slurm_gid: 982
+
+# ---------------------------------------------------------------------------
+# Packages (Ubuntu apt names)
+# ---------------------------------------------------------------------------
+munge_packages:
+  - munge
+  - libmunge2
+
+slurmd_packages:
+  - slurmd
+  - slurm-client
+
+# ---------------------------------------------------------------------------
+# Filesystem layout on the compute node
+# ---------------------------------------------------------------------------
+slurm_conf_dir: /etc/slurm
+slurmd_spool_dir: /var/spool/slurmd
+slurmd_log_dir: /var/log/slurm
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+open_firewall: true
+slurmd_port: 6818

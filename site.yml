@@ -1,0 +1,298 @@
+---
+# =============================================================================
+# site.yml — Turn a fresh Ubuntu host into a SLURM compute node
+#
+# Run this FROM the SLURM controller (or any control machine that can SSH to
+# both the controller and the new node). It:
+#
+#   Play 1  Pulls munge.key + slurm.conf (+ optional extra confs) off the
+#           controller and stages them locally.
+#   Play 2  Installs munge/slurmd on the new node(s), creates matching
+#           munge/slurm users, deploys the staged configs, and starts
+#           services.
+#   Play 3  (optional) Tells slurmctld to reconfigure and shows node status.
+#
+# Prerequisite: the new node(s) must already appear as NodeName entries in
+# slurm.conf on the controller — this playbook copies slurm.conf as-is, it
+# does not edit it for you.
+#
+# Usage:
+#   ansible-playbook site.yml
+#   ansible-playbook site.yml --limit node01
+#   ansible-playbook site.yml --skip-tags reconfigure
+# =============================================================================
+
+- name: Gather munge key and SLURM configs from the controller
+  hosts: slurm_controller
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Ensure local staging directory exists
+      become: false
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.file:
+        path: "{{ local_staging_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Verify munge key exists on controller
+      ansible.builtin.stat:
+        path: "{{ munge_key_src }}"
+      register: munge_key_stat
+
+    - name: Fail if munge key is missing on controller
+      ansible.builtin.fail:
+        msg: >-
+          munge key not found at {{ munge_key_src }} on {{ inventory_hostname }}.
+          Check slurm_controller group / munge_key_src var.
+      when: not munge_key_stat.stat.exists
+
+    - name: Fetch munge key
+      ansible.builtin.fetch:
+        src: "{{ munge_key_src }}"
+        dest: "{{ local_staging_dir }}/munge.key"
+        flat: true
+        mode: "0400"
+
+    - name: Verify slurm.conf exists on controller
+      ansible.builtin.stat:
+        path: "{{ slurm_conf_src_dir }}/slurm.conf"
+      register: slurm_conf_stat
+
+    - name: Fail if slurm.conf is missing on controller
+      ansible.builtin.fail:
+        msg: >-
+          slurm.conf not found at {{ slurm_conf_src_dir }}/slurm.conf on
+          {{ inventory_hostname }}. Check slurm_conf_src_dir var.
+      when: not slurm_conf_stat.stat.exists
+
+    - name: Fetch slurm.conf
+      ansible.builtin.fetch:
+        src: "{{ slurm_conf_src_dir }}/slurm.conf"
+        dest: "{{ local_staging_dir }}/slurm.conf"
+        flat: true
+
+    - name: Check which extra config files exist on controller
+      ansible.builtin.stat:
+        path: "{{ slurm_conf_src_dir }}/{{ item }}"
+      loop: "{{ slurm_extra_conf_files }}"
+      register: extra_conf_stats
+
+    - name: Fetch extra config files that are present
+      ansible.builtin.fetch:
+        src: "{{ slurm_conf_src_dir }}/{{ item.item }}"
+        dest: "{{ local_staging_dir }}/{{ item.item }}"
+        flat: true
+      loop: "{{ extra_conf_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists
+
+# =============================================================================
+
+- name: Configure fresh Ubuntu host as a SLURM compute node
+  hosts: compute_new
+  become: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install munge packages
+      ansible.builtin.apt:
+        name: "{{ munge_packages }}"
+        state: present
+
+    - name: Install slurmd packages
+      ansible.builtin.apt:
+        name: "{{ slurmd_packages }}"
+        state: present
+
+    # -------------------------------------------------------------------
+    # Users/groups — UIDs/GIDs must be identical across the whole cluster
+    # or munge auth + slurmd file ownership will break.
+    # -------------------------------------------------------------------
+    - name: Ensure munge group exists with correct GID
+      ansible.builtin.group:
+        name: "{{ munge_group }}"
+        gid: "{{ munge_gid }}"
+        state: present
+        system: true
+
+    - name: Ensure munge user exists with correct UID
+      ansible.builtin.user:
+        name: "{{ munge_user }}"
+        uid: "{{ munge_uid }}"
+        group: "{{ munge_group }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: /var/lib/munge
+        create_home: false
+
+    - name: Ensure slurm group exists with correct GID
+      ansible.builtin.group:
+        name: "{{ slurm_group }}"
+        gid: "{{ slurm_gid }}"
+        state: present
+        system: true
+
+    - name: Ensure slurm user exists with correct UID
+      ansible.builtin.user:
+        name: "{{ slurm_user }}"
+        uid: "{{ slurm_uid }}"
+        group: "{{ slurm_group }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: /var/lib/slurm
+        create_home: false
+
+    # -------------------------------------------------------------------
+    # munge key
+    # -------------------------------------------------------------------
+    - name: Stop munge before replacing key
+      ansible.builtin.systemd:
+        name: munge
+        state: stopped
+      failed_when: false
+
+    - name: Ensure /etc/munge directory permissions
+      ansible.builtin.file:
+        path: /etc/munge
+        state: directory
+        owner: "{{ munge_user }}"
+        group: "{{ munge_group }}"
+        mode: "0700"
+
+    - name: Deploy munge key from controller
+      ansible.builtin.copy:
+        src: "{{ local_staging_dir }}/munge.key"
+        dest: /etc/munge/munge.key
+        owner: "{{ munge_user }}"
+        group: "{{ munge_group }}"
+        mode: "0400"
+      notify: restart munge
+
+    - name: Enable and start munge
+      ansible.builtin.systemd:
+        name: munge
+        enabled: true
+        state: started
+
+    # -------------------------------------------------------------------
+    # SLURM config + directories
+    # -------------------------------------------------------------------
+    - name: Ensure /etc/slurm directory exists
+      ansible.builtin.file:
+        path: "{{ slurm_conf_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy slurm.conf from controller
+      ansible.builtin.copy:
+        src: "{{ local_staging_dir }}/slurm.conf"
+        dest: "{{ slurm_conf_dir }}/slurm.conf"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: restart slurmd
+
+    - name: Check which extra config files were staged locally
+      ansible.builtin.stat:
+        path: "{{ local_staging_dir }}/{{ item }}"
+      loop: "{{ slurm_extra_conf_files }}"
+      delegate_to: localhost
+      become: false
+      register: staged_extra_confs
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Deploy extra config files that were staged
+      ansible.builtin.copy:
+        src: "{{ local_staging_dir }}/{{ item.item }}"
+        dest: "{{ slurm_conf_dir }}/{{ item.item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ staged_extra_confs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists
+      notify: restart slurmd
+
+    - name: Ensure slurmd spool directory exists
+      ansible.builtin.file:
+        path: "{{ slurmd_spool_dir }}"
+        state: directory
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: "0755"
+
+    - name: Ensure slurm log directory exists
+      ansible.builtin.file:
+        path: "{{ slurmd_log_dir }}"
+        state: directory
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_group }}"
+        mode: "0755"
+
+    # -------------------------------------------------------------------
+    # Firewall
+    # -------------------------------------------------------------------
+    - name: Allow slurmd port through ufw
+      community.general.ufw:
+        rule: allow
+        port: "{{ slurmd_port }}"
+        proto: tcp
+      when: open_firewall
+      failed_when: false
+
+    # -------------------------------------------------------------------
+    # Start slurmd
+    # -------------------------------------------------------------------
+    - name: Enable and start slurmd
+      ansible.builtin.systemd:
+        name: slurmd
+        enabled: true
+        state: started
+
+    - name: Verify munge authentication works locally
+      ansible.builtin.shell: munge -n | unmunge
+      register: munge_test
+      changed_when: false
+      failed_when: "'STATUS:  Success' not in munge_test.stdout"
+
+  handlers:
+    - name: restart munge
+      ansible.builtin.systemd:
+        name: munge
+        state: restarted
+
+    - name: restart slurmd
+      ansible.builtin.systemd:
+        name: slurmd
+        state: restarted
+
+# =============================================================================
+
+- name: Reconfigure controller and verify new node(s)
+  hosts: slurm_controller
+  become: true
+  gather_facts: false
+  tags: [reconfigure]
+  tasks:
+    - name: Tell slurmctld to reconfigure
+      ansible.builtin.command: scontrol reconfigure
+      changed_when: true
+
+    - name: Show current node status
+      ansible.builtin.command: sinfo -N -l
+      register: sinfo_out
+      changed_when: false
+
+    - name: Display node status
+      ansible.builtin.debug:
+        var: sinfo_out.stdout_lines
