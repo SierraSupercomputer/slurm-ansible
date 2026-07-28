@@ -111,6 +111,24 @@
         state: present
 
     # -------------------------------------------------------------------
+    # apt installing the munge/slurmd packages starts+enables their
+    # daemons by default on Ubuntu. Stop them now, before we try to
+    # change the munge/slurm user UIDs below — usermod refuses to touch
+    # the UID of a user with a live running process.
+    # -------------------------------------------------------------------
+    - name: Stop munge before changing its UID
+      ansible.builtin.systemd:
+        name: munge
+        state: stopped
+      failed_when: false
+
+    - name: Stop slurmd before changing its UID
+      ansible.builtin.systemd:
+        name: slurmd
+        state: stopped
+      failed_when: false
+
+    # -------------------------------------------------------------------
     # Users/groups — UIDs/GIDs must be identical across the whole cluster
     # or munge auth + slurmd file ownership will break.
     # -------------------------------------------------------------------
@@ -150,8 +168,10 @@
 
     # -------------------------------------------------------------------
     # munge key
+    # (munge is already stopped from the UID-change step above; this is
+    # just a safety net in case it got started some other way)
     # -------------------------------------------------------------------
-    - name: Stop munge before replacing key
+    - name: Ensure munge is stopped before replacing key
       ansible.builtin.systemd:
         name: munge
         state: stopped
